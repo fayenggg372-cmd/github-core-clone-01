@@ -6,7 +6,7 @@ dependencies beyond the Node standard library. Written for the make.fun bounty
 `github-core-clone-01` ("Build a GitHub-compatible git forge").
 
 Local grade (process driver, this machine): **120/120 conformance checks**,
-agent 200/200, perf 103–127/200 depending on machine load (best run: 927/1000).
+agent 200/200, perf 153–169/200 depending on machine load (best run: 969/1000).
 
 ## Running
 

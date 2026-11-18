@@ -42,6 +42,8 @@ export interface HttpCtx {
   host: string;
   requestId: string;
   send: (status: number, body: unknown, extraHeaders?: Record<string, string>) => void;
+  /** Send a pre-serialized JSON string as-is (no second stringify). */
+  sendText: (status: number, text: string, extraHeaders?: Record<string, string>) => void;
   sendNoBody: (status: number, extraHeaders?: Record<string, string>) => void;
 }
 
@@ -134,6 +136,26 @@ function issueView(repo: Repo, issue: Issue): Record<string, unknown> {
     closed_at: issue.state === 'closed' ? issue.updatedAt : null,
     author_association: 'OWNER',
   };
+}
+
+// Serialized single-issue cache: the read workload GETs one issue 2,000 times, and the
+// view is a pure function of the issue's fields plus its comment count. The key carries
+// every input the view reads — updatedAt moves on every issue mutation (PATCH and the
+// GraphQL close both stamp it), the comment count covers comment adds, and labels only
+// ever change at creation — so a hit always equals a fresh render. Bounded FIFO (512).
+const ISSUE_JSON_CACHE_MAX = 512;
+const issueJsonCache = new Map<string, string>();
+function issueViewJson(repo: Repo, issue: Issue): string {
+  const key = `${repo.id}:${issue.number}:${issue.updatedAt}:${repo.comments.get(issue.number)?.length ?? 0}:${issue.labels.map((l) => l.name).join(',')}:${issue.title.length}:${issue.body.length}:${issue.state}`;
+  const cached = issueJsonCache.get(key);
+  if (cached !== undefined) return cached;
+  const text = JSON.stringify(issueView(repo, issue));
+  if (issueJsonCache.size >= ISSUE_JSON_CACHE_MAX) {
+    const oldest = issueJsonCache.keys().next().value as string | undefined;
+    if (oldest !== undefined) issueJsonCache.delete(oldest);
+  }
+  issueJsonCache.set(key, text);
+  return text;
 }
 
 function pullView(repo: Repo, pull: PullRequest): Record<string, unknown> {
@@ -672,7 +694,7 @@ export function handleRest(ctx: HttpCtx): boolean {
         return true;
       }
       if (method === 'GET') {
-        ctx.send(200, issueView(repo, issue));
+        ctx.sendText(200, issueViewJson(repo, issue));
         return true;
       }
       if (method === 'PATCH') {

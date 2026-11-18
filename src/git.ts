@@ -388,9 +388,9 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const declaredCount = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
-  const trailer = pack.subarray(trailerStart).toString('hex');
-  const computed = createHash('sha1').update(pack.subarray(0, trailerStart)).digest('hex');
-  if (trailer !== computed) throw new Error('pack trailer checksum mismatch');
+  const trailer = pack.subarray(trailerStart);
+  const computed = createHash('sha1').update(pack.subarray(0, trailerStart)).digest();
+  if (!trailer.equals(computed)) throw new Error('pack trailer checksum mismatch');
 
   interface RawEntry {
     offset: number;

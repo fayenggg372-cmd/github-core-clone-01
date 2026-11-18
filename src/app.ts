@@ -34,8 +34,9 @@ function nextRequestId(): string {
 function bearerToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
-  const match = /^Bearer\s+(.+)$/.exec(header);
-  return match ? (match[1] as string) : null;
+  if (!header.startsWith('Bearer ')) return null;
+  const token = header.slice(7).trim();
+  return token === '' ? null : token;
 }
 
 function authorized(req: IncomingMessage): boolean {
@@ -69,25 +70,51 @@ function readBody(req: IncomingMessage): Promise<{ body: Buffer; tooLarge: boole
 }
 
 function decodeSegments(pathname: string): string[] {
-  return pathname.split('/').filter((segment) => segment !== '').map((segment) => {
-    try {
-      return decodeURIComponent(segment);
-    } catch {
-      return segment;
+  // Fast path: most suite paths carry no escapes, so skip decodeURIComponent entirely
+  // when a segment has no '%'. A single pass replaces split/filter/map.
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i <= pathname.length; i += 1) {
+    if (i === pathname.length || pathname[i] === '/') {
+      if (i > start) {
+        const segment = pathname.slice(start, i);
+        if (segment.indexOf('%') < 0) out.push(segment);
+        else {
+          try {
+            out.push(decodeURIComponent(segment));
+          } catch {
+            out.push(segment);
+          }
+        }
+      }
+      start = i + 1;
     }
-  });
+  }
+  return out;
 }
 
 export function createApp(): Server {
   return createServer((req, res) => {
     void (async () => {
       try {
-        const url = new URL(req.url ?? '/', 'http://localhost');
+        // Parse the request line by hand: `new URL` costs more than the whole route
+        // lookup on the hot paths, and the query string is only needed by info/refs and
+        // the REST handlers, so it is parsed lazily.
+        const rawUrl = req.url ?? '/';
+        const queryAt = rawUrl.indexOf('?');
+        const pathname = queryAt < 0 ? rawUrl : rawUrl.slice(0, queryAt);
         const method = req.method ?? 'GET';
-        const segments = decodeSegments(url.pathname);
+        const segments = decodeSegments(pathname);
         const requestId = nextRequestId();
+        let searchParams: URLSearchParams | null = null;
+        const query = (): URLSearchParams => {
+          if (searchParams === null) {
+            searchParams = new URLSearchParams(queryAt < 0 ? '' : rawUrl.slice(queryAt + 1));
+          }
+          return searchParams;
+        };
 
-        if (method === 'GET' && url.pathname === '/healthz') {
+        if (method === 'GET' && pathname === '/healthz') {
           sendJson(res, 200, { ok: true }, { 'x-github-request-id': requestId });
           return;
         }
@@ -102,7 +129,7 @@ export function createApp(): Server {
             return;
           }
           if (method === 'GET' && tail === 'info/refs') {
-            const service = url.searchParams.get('service');
+            const service = query().get('service');
             if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
               sendJson(res, 400, { message: 'Missing service parameter' });
               return;
@@ -138,7 +165,15 @@ export function createApp(): Server {
             sendJson(res, 401, { message: 'Requires authentication' }, { 'x-github-request-id': requestId });
             return;
           }
-          const { body, tooLarge } = await readBody(req);
+          // GETs never carry a body the handlers read (they use path + query only), so
+          // when the headers promise no body bytes, skip the body read entirely: reading
+          // an empty body would produce exactly the same context.
+          const noBody = method === 'GET'
+            && (req.headers['content-length'] === undefined || req.headers['content-length'] === '0')
+            && req.headers['transfer-encoding'] === undefined;
+          const { body, tooLarge } = noBody
+            ? { body: Buffer.alloc(0), tooLarge: false }
+            : await readBody(req);
           if (tooLarge) {
             sendJson(res, 413, { message: 'Request body too large' }, { 'x-github-request-id': requestId });
             return;
@@ -159,7 +194,7 @@ export function createApp(): Server {
           const ctx: HttpCtx = {
             method,
             segments: segments.slice(2),
-            query: url.searchParams,
+            query: query(),
             bodyText,
             body: parsed,
             bodyMalformed,
@@ -167,6 +202,10 @@ export function createApp(): Server {
             requestId,
             send: (status, responseBody, extraHeaders = {}) => {
               sendJson(res, status, responseBody, { 'x-github-request-id': requestId, ...extraHeaders });
+            },
+            sendText: (status, text, extraHeaders = {}) => {
+              res.writeHead(status, { 'content-type': 'application/json', 'x-github-request-id': requestId, ...extraHeaders });
+              res.end(text);
             },
             sendNoBody: (status, extraHeaders = {}) => {
               res.writeHead(status, { 'x-github-request-id': requestId, ...extraHeaders });

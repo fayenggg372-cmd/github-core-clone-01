@@ -61,6 +61,41 @@ function fetchCacheStore(key: string, body: Buffer): void {
   fetchCache.set(key, body);
 }
 
+// Advertisement / ls-refs cache: both answers are pure functions of the repository's
+// refs (and, for ls-refs, the request's arguments), so they are cached under a signature
+// built from the refs themselves — any ref change changes the key, so a stale answer is
+// impossible without any invalidation bookkeeping. The suite asks for the same
+// advertisement before every push and the same ls-refs for every clone, so this turns
+// repeated pkt-line rebuilds into one Map lookup.
+const AD_CACHE_MAX = 32;
+const adCache = new Map<string, Buffer>();
+function refsSignature(repo: Repo): string {
+  let sig = '';
+  for (const [name, oid] of repo.refs) sig += `${name}=${oid};`;
+  return sig;
+}
+function adCached(key: string): Buffer | undefined {
+  return adCache.get(key);
+}
+function adCacheStore(key: string, body: Buffer): void {
+  if (adCache.has(key)) return;
+  if (adCache.size >= AD_CACHE_MAX) {
+    const oldest = adCache.keys().next().value as string | undefined;
+    if (oldest !== undefined) adCache.delete(oldest);
+  }
+  adCache.set(key, body);
+}
+
+// The v2 capability advertisement never varies: same six lines for every repository.
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  'version 2\n',
+  'agent=github-forge/1.0\n',
+  'ls-refs=unborn\n',
+  'fetch=shallow\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
 interface RefInfo {
   oid: string;
   name: string;
@@ -115,16 +150,11 @@ export function infoRefs(owner: string, repoName: string, service: GitService, w
   }
   const contentType = `application/x-${service}-advertisement`;
   if (service === 'git-upload-pack' && wantV2) {
-    const lines: Array<string | 'flush'> = [
-      'version 2\n',
-      'agent=github-forge/1.0\n',
-      'ls-refs=unborn\n',
-      'fetch=shallow\n',
-      'object-format=sha1\n',
-      'flush',
-    ];
-    return { status: 200, contentType, body: encodePktLines(lines) };
+    return { status: 200, contentType, body: V2_ADVERTISEMENT };
   }
+  const adKey = `${service}|${repo.id}|${refsSignature(repo)}`;
+  const cachedAd = adCached(adKey);
+  if (cachedAd !== undefined) return { status: 200, contentType, body: cachedAd };
   const refs = sortedRefs(repo);
   const caps = service === 'git-upload-pack' ? uploadPackCaps(repo) : receivePackCaps();
   const parts: Buffer[] = [encodePktLine(`# service=${service}\n`), pktFlush()];
@@ -142,7 +172,9 @@ export function infoRefs(owner: string, repoName: string, service: GitService, w
     }
   }
   parts.push(pktFlush());
-  return { status: 200, contentType, body: Buffer.concat(parts) };
+  const body = Buffer.concat(parts);
+  adCacheStore(adKey, body);
+  return { status: 200, contentType, body };
 }
 
 // --------------------------------------------------------------------------------------------
@@ -308,6 +340,11 @@ export function uploadPackV2(owner: string, repoName: string, body: Buffer): { s
       else if (text === 'unborn') args.unborn = true;
       else if (text.startsWith('ref-prefix ')) args.prefixes.push(text.slice('ref-prefix '.length));
     }
+    // Same cache as the advertisements: the answer is a pure function of the refs and
+    // these arguments, so a refs-signature key can never serve a stale list.
+    const lsKey = `ls-refs|${repo.id}|${refsSignature(repo)}|${args.peel ? 'p' : ''}${args.symrefs ? 's' : ''}${args.unborn ? 'u' : ''}|${args.prefixes.join(',')}`;
+    const cachedLs = adCached(lsKey);
+    if (cachedLs !== undefined) return { status: 200, contentType, body: cachedLs };
     const out: Array<string | 'flush'> = [];
     const refs = sortedRefs(repo);
     const keep = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
@@ -327,7 +364,9 @@ export function uploadPackV2(owner: string, repoName: string, body: Buffer): { s
       }
     }
     out.push('flush');
-    return { status: 200, contentType, body: encodePktLines(out) };
+    const lsBody = encodePktLines(out);
+    adCacheStore(lsKey, lsBody);
+    return { status: 200, contentType, body: lsBody };
   }
   if (command === 'fetch') {
     const cacheKey = `v2|${repo.id}|${body.toString('hex')}`;
